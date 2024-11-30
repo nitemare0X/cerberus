@@ -53,10 +53,10 @@ fn get_db_path() -> io::Result<PathBuf> {
 
 fn derive_key(password: &str, salt: &[u8]) -> Vec<u8> {
     let argon2 = Argon2::default();
-    let salt = SaltString::from_b64(&BASE64.encode(salt)).unwrap();
+    let salt_string = SaltString::encode_b64(salt).unwrap();
 
     argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes(), &salt_string)
         .unwrap()
         .to_string()
         .into_bytes()
