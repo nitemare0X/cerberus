@@ -50,6 +50,7 @@ enum Commands {
     Get {
         service: String,
     },
+    List,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,6 +103,13 @@ async fn get_password(pool: &SqlitePool, service: &str) -> sqlx::Result<Option<(
     .bind(service)
     .fetch_optional(pool)
     .await
+}
+
+async fn list_services(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_as::<_, (String,)>("SELECT service FROM passwords ORDER BY service")
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.into_iter().map(|(service,)| service).collect())
 }
 
 fn ensure_db_directory() -> io::Result<PathBuf> {
@@ -250,6 +258,21 @@ async fn main() -> io::Result<()> {
                 println!("Password for {}: {}", service, password);
             } else {
                 println!("No passwords found for service: {}", service);
+            }
+        }
+
+        Commands::List => {
+            let services = list_services(&pool)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+            if services.is_empty() {
+                println!("No stored passwords found.");
+            } else {
+                println!("Stored passwords for:");
+                for service in services {
+                    println!(" - {}", service);
+                }
             }
         }
     }

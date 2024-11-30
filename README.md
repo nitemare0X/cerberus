@@ -7,8 +7,8 @@ A secure command-line password manager written in Rust that focuses on:
 # TODO:
 
 - [x] Implement actually database usage via sqlx
-- [ ] Add command to view services in entries
-
+- [x] Add command to view services in entries
+- [ ] Refactor codebase
 
 ## Features
 
