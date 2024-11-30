@@ -50,6 +50,18 @@ cerberus generate [service] -l 32
 cerberus get github
 ```
 
+4. List password: 
+
+```bash
+cerberus list
+```
+
+5. Insert existing passwords:
+
+```bash
+cerberus insert [service]
+```
+
 ## Storage Location
 
 Passwords are stored encrypted in:
