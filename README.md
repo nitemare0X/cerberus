@@ -6,7 +6,7 @@ A secure command-line password manager written in Rust that focuses on:
 
 # TODO:
 
-- [ ] Implement actually database usage via sqlx
+- [x] Implement actually database usage via sqlx
 - [ ] Add command to view services in entries
 
 
@@ -22,7 +22,7 @@ A secure command-line password manager written in Rust that focuses on:
 ## Installation
 
 ``` bash
-git clone https://github.com/yourusername/cerberus
+git clone https://github.com/nitemare0x/cerberus
 cd cerberus
 cargo install --path .
 ```
@@ -38,10 +38,10 @@ cerberus init
 2. Generate new passwords:
 
 ```bash 
-cerberus generate [length] [service]
+cerberus generate [service]
 
-# ex:
-cerberus generate 16 github
+# With  custom length: 
+cerberus generate [service] -l 32
 ```
 
 3. Retrieve a password: 

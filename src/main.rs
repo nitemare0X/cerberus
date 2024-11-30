@@ -6,12 +6,31 @@ use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{prelude::SliceRandom, Rng};
 use rpassword::read_password;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqlitePool;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+// Migration to create tables
+const INIT_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS master_key (
+    id INTEGER PRIMARY KEY,
+    salt TEXT NOT NULL,
+    key_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passwords (
+    id INTEGER PRIMARY KEY,
+    service TEXT NOT NULL UNIQUE,
+    encrypted_password TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"#;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,8 +42,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Init,
-    Generate { length: usize, service: String },
-    Get { service: String },
+    Generate {
+        service: String,
+        #[clap(short, long, default_value = "16")]
+        length: usize,
+    },
+    Get {
+        service: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,14 +66,52 @@ struct Database {
     entries: Vec<PasswordEntry>,
 }
 
-fn get_db_path() -> io::Result<PathBuf> {
+async fn init_db(pool: &SqlitePool) -> sqlx::Result<()> {
+    sqlx::query(INIT_SQL).execute(pool).await?;
+    Ok(())
+}
+
+async fn save_master_key(pool: &SqlitePool, salt: &str, key_hash: &str) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO master_key (salt, key_hash) VALUES (?, ?)")
+        .bind(salt)
+        .bind(key_hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn save_password(
+    pool: &SqlitePool,
+    service: &str,
+    encrypted_password: &str,
+    nonce: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO passwords (service, encrypted_password, nonce) VALUES (?, ?, ?)")
+        .bind(service)
+        .bind(encrypted_password)
+        .bind(nonce)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn get_password(pool: &SqlitePool, service: &str) -> sqlx::Result<Option<(String, String)>> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT encrypted_password, nonce FROM passwords WHERE service = ?",
+    )
+    .bind(service)
+    .fetch_optional(pool)
+    .await
+}
+
+fn ensure_db_directory() -> io::Result<PathBuf> {
     let proj_dirs = ProjectDirs::from("com", "cerberus", "password-manager")
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get project directory"))?;
 
     let config_dir = proj_dirs.config_dir();
     fs::create_dir_all(config_dir)?;
 
-    Ok(config_dir.join("passwords.db"))
+    Ok(config_dir.to_path_buf())
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> Vec<u8> {
@@ -102,78 +165,140 @@ fn read_master_password(confirm: bool) -> io::Result<String> {
     Ok(password)
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    let db_path = get_db_path()?;
+    let db_dir = ensure_db_directory()?;
+    let db_path = db_dir.join("passwords.db");
+
+    let _database_url = format!("sqlite://{}", db_path.display());
+
+    let connection_options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true);
+
+    let pool = SqlitePool::connect_with(connection_options)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     match cli.command {
         Commands::Init => {
-            let master_password = read_master_password(true)?;
+            init_db(&pool)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+            let master_password = read_master_password(true)?;
             let salt: [u8; 32] = rand::thread_rng().gen();
             let key = derive_key(&master_password, &salt);
 
-            let db = Database {
-                salt: BASE64.encode(salt),
-                key_hash: BASE64.encode(&key),
-                entries: Vec::new(),
-            };
+            save_master_key(&pool, &BASE64.encode(salt), &BASE64.encode(&key))
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-            fs::write(&db_path, serde_json::to_string(&db).unwrap())?;
             println!("Cerberus initialized successfully");
         }
 
         Commands::Generate { length, service } => {
             let master_password = read_master_password(false)?;
 
-            let db_connect = fs::read_to_string(&db_path)?;
-            let mut db: Database = serde_json::from_str(&db_connect)?;
+            let salt = if let Some((salt,)) =
+                sqlx::query_as::<_, (String,)>("SELECT salt FROM master_key LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            {
+                salt
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Master key not found"));
+            };
 
-            let salt = BASE64.decode(&db.salt).unwrap();
+            let salt = BASE64.decode(&salt).unwrap();
             let key = derive_key(&master_password, &salt);
 
-            let password: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(length)
-                .chain(std::iter::once(b'@'))
-                .chain(std::iter::once(b'#'))
-                .chain(std::iter::once(b'$'))
-                .map(char::from)
-                .collect();
-
+            let password: String = generate_strong_password(Some(length));
             let (encrypted_password, nonce) = encrypt_password(&key, &password);
 
-            db.entries.push(PasswordEntry {
-                service,
-                encrypted_password,
-                nonce,
-            });
+            save_password(&pool, &service, &encrypted_password, &nonce)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-            fs::write(&db_path, serde_json::to_string(&db).unwrap())?;
             println!("Generated password: {}", password);
-            // Encrypt and Save the password here
         }
 
         Commands::Get { service } => {
             let master_password = read_master_password(false)?;
 
-            let db_connect = fs::read_to_string(&db_path)?;
-            let db: Database = serde_json::from_str(&db_connect)?;
+            let salt = if let Some((salt,)) =
+                sqlx::query_as::<_, (String,)>("SELECT salt FROM master_key LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            {
+                salt
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Master key not found"));
+            };
 
-            let salt = BASE64.decode(&db.salt).unwrap();
+            let salt = BASE64.decode(&salt).unwrap();
             let key = derive_key(&master_password, &salt);
 
-            if let Some(entry) = db.entries.iter().find(|e| e.service == service) {
-                let password = decrypt_password(&key, &entry.encrypted_password, &entry.nonce);
+            if let Some((encrypted_password, nonce)) = get_password(&pool, &service)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            {
+                let password = decrypt_password(&key, &encrypted_password, &nonce);
                 println!("Password for {}: {}", service, password);
             } else {
-                println!("No password found for service: {}", service);
+                println!("No passwords found for service: {}", service);
             }
-
-            // Decrypt and retrieve the password
-            //println!("Retrieved password for service: {}", service);
         }
     }
 
     Ok(())
+}
+
+fn generate_strong_password(length: Option<usize>) -> String {
+    let length = length.unwrap_or(16);
+
+    let uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let lowercase = "abcdefghijklmnopqrstuvwxyz";
+    let numbers = "0123456789";
+    let symbols = "!@#$%^&*()_+-=[]{}|;:,.<>?";
+
+    let all_chars = format!("{}{}{}{}", uppercase, lowercase, numbers, symbols);
+    let mut rng = rand::thread_rng();
+
+    let mut password: String = vec![
+        uppercase
+            .chars()
+            .nth(rng.gen_range(0..uppercase.len()))
+            .unwrap(),
+        lowercase
+            .chars()
+            .nth(rng.gen_range(0..lowercase.len()))
+            .unwrap(),
+        numbers
+            .chars()
+            .nth(rng.gen_range(0..numbers.len()))
+            .unwrap(),
+        symbols
+            .chars()
+            .nth(rng.gen_range(0..symbols.len()))
+            .unwrap(),
+    ]
+    .into_iter()
+    .collect();
+
+    while password.len() < length {
+        password.push(
+            all_chars
+                .chars()
+                .nth(rng.gen_range(0..all_chars.len()))
+                .unwrap(),
+        );
+    }
+
+    let mut password_chars: Vec<char> = password.chars().collect();
+    password_chars.shuffle(&mut rng);
+    password_chars.into_iter().collect()
 }
