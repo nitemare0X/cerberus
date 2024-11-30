@@ -47,6 +47,9 @@ enum Commands {
         #[clap(short, long, default_value = "16")]
         length: usize,
     },
+    Insert {
+        service: String,
+    },
     Get {
         service: String,
     },
@@ -231,6 +234,34 @@ async fn main() -> io::Result<()> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
             println!("Generated password: {}", password);
+        }
+
+        Commands::Insert { service } => {
+            let master_password = read_master_password(false)?;
+
+            let salt = if let Some((salt,)) =
+                sqlx::query_as::<_, (String,)>("SELECT salt FROM master_key LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            {
+                salt
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Master key not found"));
+            };
+
+            let salt = BASE64.decode(&salt).unwrap();
+            let key = derive_key(&master_password, &salt);
+
+            println!("Enter password to store: ");
+            let password: String = read_password()?;
+            let (encrypted_password, nonce) = encrypt_password(&key, &password);
+
+            save_password(&pool, &service, &encrypted_password, &nonce)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+            println!("Inserted password for service: {}", service);
         }
 
         Commands::Get { service } => {
